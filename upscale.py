@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# Upscale V3
+# File này đã bao gồm:
+# 1. Argument --simple-progress mới.
+# 2. Thuộc tính self.simple_progress trong class Upscale.
+# 3. Hàm __process_single_image (để tránh lặp code).
+# 4. Hàm run() đã cập nhật với logic if self.simple_progress: để in ra Upscaled: {idx}/{total_images} cho GUI của bạn.
+# 5. Thêm bản vá typing.OrderedDict
 # -*- coding: utf-8 -*-
 
 import logging
@@ -7,6 +14,7 @@ from collections import OrderedDict
 from enum import Enum
 from pathlib import Path
 from typing import List, Optional, Union
+import typing # <-- THÊM DÒNG NÀY (Cần thiết cho bản vá)
 
 import cv2
 import numpy as np
@@ -54,6 +62,7 @@ class Upscale:
     alpha_boundary_offset: float = None
     alpha_mode: AlphaOptions = None
     log: logging.Logger = None
+    simple_progress: bool = False # <-- ĐÃ THÊM
 
     device: torch.device = None
     in_nc: int = None
@@ -85,6 +94,7 @@ class Upscale:
         alpha_threshold: float = 0.5,
         alpha_boundary_offset: float = 0.2,
         alpha_mode: Optional[AlphaOptions] = None,
+        simple_progress: bool = False, # <-- ĐÃ THÊM
         log: logging.Logger = logging.getLogger(),
     ) -> None:
         self.model_str = model
@@ -103,6 +113,7 @@ class Upscale:
         self.alpha_threshold = alpha_threshold
         self.alpha_boundary_offset = alpha_boundary_offset
         self.alpha_mode = alpha_mode
+        self.simple_progress = simple_progress # <-- ĐÃ THÊM
         self.log = log
         if self.fp16:
             torch.set_default_tensor_type(
@@ -165,98 +176,151 @@ class Upscale:
         # TODO: there might be a better way of doing this but it's good enough for now
         split_depths = {}
 
-        with Progress(
-            # SpinnerColumn(),
-            "[progress.description]{task.description}",
-            BarColumn(),
-            "[progress.percentage]{task.percentage:>3.0f}%",
-            TimeRemainingColumn(),
-        ) as progress:
-            task_upscaling = progress.add_task("Upscaling", total=len(images))
+        # ===== LOGIC XỬ LÝ ĐÃ THAY ĐỔI =====
+        total_images = len(images)
+        
+        if self.simple_progress:
+            # Chế độ đơn giản cho GUI, không dùng rich.progress
             for idx, img_path in enumerate(images, 1):
-                img_input_path_rel = img_path.relative_to(self.input)
-                output_dir = self.output.joinpath(img_input_path_rel).parent
-                img_output_path_rel = output_dir.joinpath(f"{img_path.stem}.png")
-                output_dir.mkdir(parents=True, exist_ok=True)
-                if len(model_chain) == 1:
-                    self.log.info(
-                        f'Processing {str(idx).zfill(len(str(len(images))))}: "{img_input_path_rel}"'
+                # Gọi hàm xử lý
+                processed = self.__process_single_image(
+                    img_path=img_path,
+                    images=images,
+                    idx=idx,
+                    split_depths=split_depths,
+                    model_chain=model_chain,
+                    progress=None,
+                    task_upscaling=None
+                )
+                
+                # Nếu xử lý (không bị skip), in ra output cho GUI
+                if processed:
+                    print(f"Upscaled: {idx}/{total_images}")
+                    sys.stdout.flush() # Đẩy output ra ngay lập tức
+        
+        else:
+            # Chế độ rich.progress (như code gốc)
+            with Progress(
+                "[progress.description]{task.description}",
+                BarColumn(),
+                "[progress.percentage]{task.percentage:>3.0f}%",
+                TimeRemainingColumn(),
+            ) as progress:
+                task_upscaling = progress.add_task("Upscaling", total=total_images)
+                for idx, img_path in enumerate(images, 1):
+                    # Gọi hàm xử lý với các đối tượng progress
+                    self.__process_single_image(
+                        img_path=img_path,
+                        images=images,
+                        idx=idx,
+                        split_depths=split_depths,
+                        model_chain=model_chain,
+                        progress=progress,
+                        task_upscaling=task_upscaling
                     )
-                if self.skip_existing and img_output_path_rel.is_file():
-                    self.log.warning("Already exists, skipping")
-                    if self.delete_input:
-                        img_path.unlink(missing_ok=True)
-                    progress.advance(task_upscaling)
-                    continue
-                # read image
-                # We use imdecode instead of imread to work around Unicode breakage on Windows.
-                # See https://jdhao.github.io/2019/09/11/opencv_unicode_image_path/
-                img = cv2.imdecode(np.fromfile(str(img_path.absolute()), dtype=np.uint8), cv2.IMREAD_UNCHANGED)
-                if len(img.shape) < 3:
-                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        # ===== KẾT THÚC THAY ĐỔI =====
 
-                # Seamless modes
-                if self.seamless == SeamlessOptions.TILE:
-                    img = cv2.copyMakeBorder(img, 16, 16, 16, 16, cv2.BORDER_WRAP)
-                elif self.seamless == SeamlessOptions.MIRROR:
-                    img = cv2.copyMakeBorder(
-                        img, 16, 16, 16, 16, cv2.BORDER_REFLECT_101
-                    )
-                elif self.seamless == SeamlessOptions.REPLICATE:
-                    img = cv2.copyMakeBorder(img, 16, 16, 16, 16, cv2.BORDER_REPLICATE)
-                elif self.seamless == SeamlessOptions.ALPHA_PAD:
-                    img = cv2.copyMakeBorder(
-                        img, 16, 16, 16, 16, cv2.BORDER_CONSTANT, value=[0, 0, 0, 0]
-                    )
-                final_scale: int = 1
-
-                task_model_chain: TaskID = None
-                if len(model_chain) > 1:
-                    task_model_chain = progress.add_task(
-                        f'{str(idx).zfill(len(str(len(images))))} - "{img_input_path_rel}"',
-                        total=len(model_chain),
-                    )
-                for i, model_path in enumerate(model_chain):
-
-                    img_height, img_width = img.shape[:2]
-
-                    # Load the model so we can access the scale
-                    self.load_model(model_path)
-
-                    if self.cache_max_split_depth and len(split_depths.keys()) > 0:
-                        rlt, depth = ops.auto_split_upscale(
-                            img,
-                            self.upscale,
-                            self.last_scale,
-                            max_depth=split_depths[i],
-                        )
-                    else:
-                        rlt, depth = ops.auto_split_upscale(
-                            img, self.upscale, self.last_scale
-                        )
-                        split_depths[i] = depth
-
-                    final_scale *= self.last_scale
-
-                    # This is for model chaining
-                    img = rlt.astype("uint8")
-                    if len(model_chain) > 1:
-                        progress.advance(task_model_chain)
-
-                if self.seamless:
-                    rlt = self.crop_seamless(rlt, final_scale)
-
-                # We use imencode instead of imwrite to work around Unicode breakage on Windows.
-                # See https://jdhao.github.io/2019/09/11/opencv_unicode_image_path/
-                is_success, im_buf_arr = cv2.imencode(".png", rlt)
-                if not is_success:
-                    raise Exception('cv2.imencode failure')
-                im_buf_arr.tofile(str(img_output_path_rel.absolute()))
-
-                if self.delete_input:
-                    img_path.unlink(missing_ok=True)
-
+    # ===== HÀM MỚI ĐƯỢC THÊM VÀO =====
+    def __process_single_image(
+        self,
+        img_path: Path,
+        images: List[Path],
+        idx: int,
+        split_depths: dict,
+        model_chain: List[str],
+        progress: Optional[Progress],
+        task_upscaling: Optional[TaskID],
+    ) -> bool:
+        """
+        Xử lý một ảnh đơn. Trả về True nếu xử lý, False nếu bỏ qua.
+        """
+        img_input_path_rel = img_path.relative_to(self.input)
+        output_dir = self.output.joinpath(img_input_path_rel).parent
+        img_output_path_rel = output_dir.joinpath(f"{img_path.stem}.png")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        if len(model_chain) == 1 and not self.simple_progress: # Chỉ log khi không ở chế độ simple
+            self.log.info(
+                f'Processing {str(idx).zfill(len(str(len(images))))}: "{img_input_path_rel}"'
+            )
+            
+        if self.skip_existing and img_output_path_rel.is_file():
+            if not self.simple_progress: # Chỉ log khi không ở chế độ simple
+                self.log.warning("Already exists, skipping")
+            if self.delete_input:
+                img_path.unlink(missing_ok=True)
+            if progress and task_upscaling:
                 progress.advance(task_upscaling)
+            return False # Bỏ qua
+            
+        # read image
+        # We use imdecode instead of imread to work around Unicode breakage on Windows.
+        img = cv2.imdecode(np.fromfile(str(img_path.absolute()), dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        if len(img.shape) < 3:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+        # Seamless modes
+        if self.seamless == SeamlessOptions.TILE:
+            img = cv2.copyMakeBorder(img, 16, 16, 16, 16, cv2.BORDER_WRAP)
+        elif self.seamless == SeamlessOptions.MIRROR:
+            img = cv2.copyMakeBorder(
+                img, 16, 16, 16, 16, cv2.BORDER_REFLECT_101
+            )
+        elif self.seamless == SeamlessOptions.REPLICATE:
+            img = cv2.copyMakeBorder(img, 16, 16, 16, 16, cv2.BORDER_REPLICATE)
+        elif self.seamless == SeamlessOptions.ALPHA_PAD:
+            img = cv2.copyMakeBorder(
+                img, 16, 16, 16, 16, cv2.BORDER_CONSTANT, value=[0, 0, 0, 0]
+            )
+        
+        final_scale: int = 1
+
+        task_model_chain: TaskID = None
+        if progress and len(model_chain) > 1:
+            task_model_chain = progress.add_task(
+                f'{str(idx).zfill(len(str(len(images))))} - "{img_input_path_rel}"',
+                total=len(model_chain),
+            )
+            
+        for i, model_path in enumerate(model_chain):
+            img_height, img_width = img.shape[:2]
+            self.load_model(model_path)
+
+            if self.cache_max_split_depth and len(split_depths.keys()) > 0:
+                rlt, depth = ops.auto_split_upscale(
+                    img,
+                    self.upscale,
+                    self.last_scale,
+                    max_depth=split_depths[i],
+                )
+            else:
+                rlt, depth = ops.auto_split_upscale(
+                    img, self.upscale, self.last_scale
+                )
+                split_depths[i] = depth
+
+            final_scale *= self.last_scale
+            img = rlt.astype("uint8")
+            if progress and task_model_chain:
+                progress.advance(task_model_chain)
+
+        if self.seamless:
+            rlt = self.crop_seamless(rlt, final_scale)
+
+        # We use imencode instead of imwrite to work around Unicode breakage on Windows.
+        is_success, im_buf_arr = cv2.imencode(".png", rlt)
+        if not is_success:
+            raise Exception('cv2.imencode failure')
+        im_buf_arr.tofile(str(img_output_path_rel.absolute()))
+
+        if self.delete_input:
+            img_path.unlink(missing_ok=True)
+
+        if progress and task_upscaling:
+            progress.advance(task_upscaling)
+            
+        return True # Đã xử lý
+    # ===== KẾT THÚC HÀM MỚI =====
 
     def __check_model_path(self, model_path: str) -> str:
         if Path(model_path).is_file():
@@ -303,8 +367,13 @@ class Upscale:
                 "&" in model_path or "|" in model_path
             ):
                 interps = model_path.split("&")[:2]
-                model_1 = torch.load(interps[0].split("@")[0])
-                model_2 = torch.load(interps[1].split("@")[0])
+                
+                # --- FIX: Thêm context manager để cho phép typing.OrderedDict ---
+                with torch.serialization.safe_globals([typing.OrderedDict]):
+                    model_1 = torch.load(interps[0].split("@")[0])
+                    model_2 = torch.load(interps[1].split("@")[0])
+                # --- KẾT THÚC FIX ---
+                
                 state_dict = OrderedDict()
                 for k, v_1 in model_1.items():
                     v_2 = model_2[k]
@@ -312,7 +381,10 @@ class Upscale:
                         int(interps[1].split("@")[1]) / 100
                     ) * v_2
             else:
-                state_dict = torch.load(model_path)
+                # --- FIX: Thêm context manager để cho phép typing.OrderedDict ---
+                with torch.serialization.safe_globals([typing.OrderedDict]):
+                    state_dict = torch.load(model_path)
+                # --- KẾT THÚC FIX ---
 
             # SRVGGNet Real-ESRGAN (v2)
             if (
@@ -545,6 +617,13 @@ def main(
         "-v",
         help="Verbose mode",
     ),
+    # ===== ARGUMENT MỚI ĐÃ THÊM VÀO =====
+    simple_progress: bool = typer.Option(
+        False,
+        "--simple-progress",
+        "-sp",
+        help="Output simple, machine-readable progress for GUIs.",
+    ),
 ):
 
     logging.basicConfig(
@@ -572,6 +651,7 @@ def main(
         alpha_threshold=alpha_threshold,
         alpha_boundary_offset=alpha_boundary_offset,
         alpha_mode=alpha_mode,
+        simple_progress=simple_progress, # <-- ĐÃ THÊM
     )
     upscale.run()
 
